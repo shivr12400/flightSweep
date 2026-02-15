@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 API_ENDPOINT = "https://5ny2oufcs1.execute-api.us-east-1.amazonaws.com/production"
 # Fallback location (Woodbridge, NJ) if user hasn't sent GPS yet
 DEFAULT_LAT, DEFAULT_LON = 40.587787, -74.333724 
-RADIUS_NM = 5
+RADIUS_NM = 10  
 AE_KEY = "5938ea-d28797"
 
 dynamodb = boto3.resource('dynamodb')
@@ -44,13 +44,22 @@ def get_ae_timetable_data(callsign):
             est_dep = dep.get('estimatedTime') or dep.get('scheduledTime')
             est_arr = arr.get('estimatedTime') or arr.get('scheduledTime')
             ac_type = f.get('aircraft', {}).get('icaoCode', 'UNK')
+            airline_name = f.get('airline', {}).get('name', 'Unknown Airline')
+
+            # Check for delay (API usually provides 'delay' in minutes)
+            delay_val = dep.get('delay')
+            dep_delay = None
+            if delay_val and int(delay_val) > 0:
+                dep_delay = f"DELAY +{delay_val}m"
 
             return {
                 "origin": dep.get('iataCode', 'UNK'),
                 "dest": arr.get('iataCode', 'UNK'),
                 "est_dep": est_dep,
                 "est_arr": est_arr,
-                "type": ac_type
+                "type": ac_type,
+                "dep_delay": dep_delay,
+                "airline": airline_name
             }
     except Exception as e:
         print(f"AE Timetable Error for {callsign}: {e}")
@@ -58,14 +67,14 @@ def get_ae_timetable_data(callsign):
 
 def get_route_info(callsign):
     if not callsign or callsign == 'N/A': 
-        return "UNK", "UNK", None, None, "UNK"
+        return "UNK", "UNK", None, None, "UNK", None, "Unknown Airline"
     
     # 1. Check Cache
     try:
         res = cache_table.get_item(Key={'callsign': callsign})
         if 'Item' in res:
             i = res['Item']
-            return i['origin'], i['dest'], i.get('est_dep'), i.get('est_arr'), i.get('type', 'UNK')
+            return i['origin'], i['dest'], i.get('est_dep'), i.get('est_arr'), i.get('type', 'UNK'), i.get('dep_delay'), i.get('airline', 'Unknown Airline')
     except: pass
 
     # 2. Fetch Fresh Data
@@ -74,15 +83,17 @@ def get_route_info(callsign):
         # Cache for 1 hour (TTL logic can be added to DynamoDB)
         cache_table.put_item(Item={
             'callsign': callsign, 'origin': data['origin'], 'dest': data['dest'], 
-            'est_dep': data['est_dep'], 'est_arr': data['est_arr'], 'type': data['type']
+            'est_dep': data['est_dep'], 'est_arr': data['est_arr'], 'type': data['type'],
+            'dep_delay': data['dep_delay'], 'airline': data['airline']
         })
-        return data['origin'], data['dest'], data['est_dep'], data['est_arr'], data['type']
+        return data['origin'], data['dest'], data['est_dep'], data['est_arr'], data['type'], data['dep_delay'], data['airline']
     
-    return "UNK", "UNK", None, None, "UNK"
+    return "UNK", "UNK", None, None, "UNK", None, "Unknown Airline"
 
 def fetch_and_broadcast_for_user(connection_id, user_lat, user_lon):
     """Fetches ADSB data for a specific user location and sends it."""
-    adsb_url = f"https://api.adsb.lol/v2/point/{round(user_lat,4)}/{round(user_lon,4)}/{RADIUS_NM}"
+    # Using 'closest' endpoint with dynamic radius (10nm)
+    adsb_url = f"https://api.adsb.lol/v2/closest/{round(user_lat,4)}/{round(user_lon,4)}/{RADIUS_NM}"
     
     try:
         resp = http.request('GET', adsb_url)
@@ -97,12 +108,12 @@ def fetch_and_broadcast_for_user(connection_id, user_lat, user_lon):
                 lat, lon = float(p.get('lat', 0)), float(p.get('lon', 0))
                 dist = haversine(user_lat, user_lon, lat, lon)
                 
-                # Filter strictly by distance (ADSB API box is square, this makes it circular)
+                # Check distance (API is box, we want circle radius)
                 if dist <= RADIUS_NM:
                     callsign = str(p.get('flight', 'N/A')).strip()
                     
-                    # Fetch extra details (Route, Aircraft Type, Times)
-                    origin, dest, dep, arr, ac_type = get_route_info(callsign)
+                    # Fetch extra details (Route, Aircraft Type, Times, Delay, Airline)
+                    origin, dest, dep, arr, ac_type, dep_delay, airline = get_route_info(callsign)
                     
                     # Time Left Calc (Backend Side)
                     time_left = None
@@ -122,7 +133,9 @@ def fetch_and_broadcast_for_user(connection_id, user_lat, user_lon):
                         'origin': origin, 'dest': dest,
                         'est_dep': dep, 'est_arr': arr, 
                         'time_left': time_left, 
-                        'type': ac_type
+                        'type': ac_type,
+                        'dep_delay': dep_delay,
+                        'airline': airline
                     })
             
             # Pick the closest one
@@ -130,15 +143,14 @@ def fetch_and_broadcast_for_user(connection_id, user_lat, user_lon):
                 planes.sort(key=lambda x: x['dist'])
                 best_plane = planes[0]
 
-        # Send Update (or Empty if no planes)
-        if best_plane:
-            payload = json.dumps({'type': 'radar_update', 'flight': best_plane})
-            try: 
-                apigw.post_to_connection(ConnectionId=connection_id, Data=payload)
-            except apigw.exceptions.GoneException:
-                connections_table.delete_item(Key={'connectionId': connection_id})
-            except Exception as e:
-                print(f"Send Error {connection_id}: {e}")
+        # SEND UPDATE (Even if None)
+        payload = json.dumps({'type': 'radar_update', 'flight': best_plane})
+        try: 
+            apigw.post_to_connection(ConnectionId=connection_id, Data=payload)
+        except apigw.exceptions.GoneException:
+            connections_table.delete_item(Key={'connectionId': connection_id})
+        except Exception as e:
+            print(f"Send Error {connection_id}: {e}")
                 
     except Exception as e:
         print(f"ADSB Fetch Error: {e}")
@@ -151,7 +163,6 @@ def lambda_handler(event, context):
     """
     
     # --- MODE 1: Handle Location Update from UI ---
-    # The UI sends: { "action": "update_location", "lat": 12.34, "lon": 56.78 }
     if event.get('body'):
         try:
             body = json.loads(event['body'])
